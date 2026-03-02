@@ -94,6 +94,7 @@ def configure_library_environment() -> None:
 
 
 def _load_librtlsdr() -> ctypes.CDLL:
+    # Try explicit candidate paths first so local/Homebrew installs work without system linker changes.
     last_error = None
     for lib in _candidate_rtlsdr_paths():
         try:
@@ -132,6 +133,7 @@ class CompatRtlSdr:
         self.lib.rtlsdr_reset_buffer(self.dev)
 
     def _setup_api(self) -> None:
+        # Declare ctypes signatures once so per-call marshalling stays predictable and fast.
         self.lib.rtlsdr_get_device_count.argtypes = []
         self.lib.rtlsdr_get_device_count.restype = ctypes.c_uint32
         self.lib.rtlsdr_get_device_name.argtypes = [ctypes.c_uint32]
@@ -205,6 +207,7 @@ class CompatRtlSdr:
             raise RuntimeError(f"rtlsdr_set_tuner_gain failed with code {rc}")
 
     def read_samples(self, count: int) -> np.ndarray:
+        # Read interleaved uint8 IQ from librtlsdr and normalize to complex64 [-1, 1].
         byte_count = int(count) * 2
         if self._read_buf is None or self._read_buf_len != byte_count:
             self._read_buf = (ctypes.c_ubyte * byte_count)()
@@ -265,6 +268,7 @@ def fm_demod(samples: np.ndarray, prev: complex) -> tuple[np.ndarray, complex]:
 def deemphasis(x: np.ndarray, fs: float, tau_s: float, y_last: float) -> tuple[np.ndarray, float]:
     if x.size == 0:
         return x, y_last
+    # Keep deemphasis state chunk-to-chunk by seeding lfilter with the previous output sample.
     b, a = _deemphasis_coeffs(float(fs), float(tau_s))
     y, zf = lfilter(b, a, x.astype(np.float32, copy=False), zi=np.array([y_last], dtype=np.float32))
     return y.astype(np.float32, copy=False), float(zf[0])
@@ -272,6 +276,7 @@ def deemphasis(x: np.ndarray, fs: float, tau_s: float, y_last: float) -> tuple[n
 
 @lru_cache(maxsize=8)
 def _deemphasis_coeffs(fs: float, tau_s: float) -> tuple[np.ndarray, np.ndarray]:
+    # 1-pole IIR matching analog FM deemphasis: y[n] = (1-a)x[n] + a*y[n-1].
     alpha = math.exp(-1.0 / (fs * tau_s))
     b = np.array([1.0 - alpha], dtype=np.float32)
     a = np.array([1.0, -alpha], dtype=np.float32)
@@ -299,6 +304,7 @@ class RuntimeConfig:
 
 
 def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeConfig:
+    # Validate rate relationships and derive all fixed DSP constants once at startup.
     if args.sample_rate % args.audio_rate != 0:
         raise ValueError("sample-rate must be an integer multiple of audio-rate")
 
@@ -370,6 +376,7 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
 
 
 def _open_configured_sdr(device_index: int, sample_rate: int, center_hz: float, gain_db: float) -> CompatRtlSdr:
+    # Enumerate first so device-index errors are explicit before opening hardware.
     detected = CompatRtlSdr.list_devices()
     print(f"Detected RTL-SDR devices: {len(detected)}")
     for i, name in enumerate(detected):
@@ -441,6 +448,7 @@ def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[C
 
 class PolyphaseFftChannelizer:
     def __init__(self, sample_rate: int, decimation: int, taps_per_phase: int = 16) -> None:
+        # Build a decimation-way analysis filter bank: polyphase FIR branches + FFT recombination.
         self.decimation = decimation
         self.sample_rate = sample_rate
         prototype_len = decimation * taps_per_phase
@@ -450,6 +458,7 @@ class PolyphaseFftChannelizer:
         self.phase_zis = [lfilter_zi(t, [1.0]).astype(np.complex64) for t in self.phase_taps]
 
     def process(self, iq: np.ndarray) -> np.ndarray:
+        # Output shape: [coarse_bin, time] at sample_rate/decimation.
         n_out = iq.size // self.decimation
         if n_out == 0:
             return np.zeros((self.decimation, 0), dtype=np.complex64)
@@ -470,6 +479,7 @@ def _extract_narrowband_channel(
     decimation_stage1: int,
     decimation_stage2: int,
 ) -> np.ndarray:
+    # Fine-tune selected coarse bin to exact channel center, then run staged LPF+decimation to audio rate.
     coarse = coarse_bins[st.coarse_bin_index]
     shifted, st.residual_osc = _mix_with_oscillator(coarse, np.complex64(st.residual_osc), np.complex64(st.residual_step))
     return _multistage_decimate(
@@ -520,6 +530,7 @@ def _multistage_decimate(
     decimation_stage1: int,
     decimation_stage2: int,
 ) -> np.ndarray:
+    # Decimate in two cheaper stages to reduce FIR cost at higher rates.
     stage1, post1_zi[:] = lfilter(post1_lpf_taps, [1.0], shifted, zi=post1_zi)
     out = stage1[::decimation_stage1]
     if decimation_stage2 > 1:
@@ -529,6 +540,7 @@ def _multistage_decimate(
 
 
 def _mix_with_oscillator(iq: np.ndarray, mixer_osc: np.complex64, mixer_step: np.complex64) -> tuple[np.ndarray, np.complex64]:
+    # Generate chunk-local NCO by recurrence (cumprod) to avoid per-sample trig calls.
     n = iq.size
     if n == 0:
         return iq, mixer_osc
@@ -555,6 +567,7 @@ def _coarse_should_process_channel(
     monitor_coarse_db: float,
     args: argparse.Namespace,
 ) -> bool:
+    # Stage-1 gate: skip expensive fine DSP unless coarse-bin energy rises above learned baseline.
     coarse_delta_db = _power_db(coarse_stream) - monitor_coarse_db
     if st.coarse_delta_floor_db is None:
         st.coarse_delta_floor_db = coarse_delta_db
@@ -574,6 +587,7 @@ def _channel_should_record(
     args: argparse.Namespace,
     squelch_hold_samples: int,
 ) -> bool:
+    # Stage-2 gate with hysteresis and hold-time on the fully narrowed channel stream.
     chunk_audio_samples = len(narrow)
     ch_db = _power_db(narrow)
     delta_db = ch_db - monitor_db
@@ -617,6 +631,7 @@ def _channel_should_record(
 
 
 def _write_audio_to_wav(st: ChannelState, narrow: np.ndarray, audio_rate: int, audio_gain: float) -> None:
+    # FM demod -> deemphasis -> level/clip -> 16-bit PCM.
     demod, st.prev_sample = fm_demod(narrow, st.prev_sample)
     audio, st.deemp_last = deemphasis(demod, audio_rate, 50e-6, st.deemp_last)
     if audio.size:
@@ -667,6 +682,7 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
     running = True
 
     try:
+        # Precompute immutable runtime DSP config before touching hardware.
         cfg = _build_runtime_config(args, plan)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -692,6 +708,7 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
 
         # 3) Stream IQ chunks, evaluate squelch, and write per-channel WAV audio.
         while running:
+            # Everything below is hot-path: avoid per-iteration recomputation where possible.
             iq = sdr.read_samples(args.chunk_size).astype(np.complex64, copy=False)
             n = iq.size
             if n == 0:
