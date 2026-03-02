@@ -1,22 +1,10 @@
-# PMR446 USB Recorder
+# Radio Recorder (RTL-SDR)
 
-Python implementation for recording PMR446 channels 1-16 from a single USB RTL-SDR.
+Generic USB RTL-SDR recorder with per-channel WAV output and per-channel squelch.
 
-## Why Python
-Python is the most practical choice for this first version because:
-- USB RTL-SDR access is straightforward (direct `ctypes` to `librtlsdr`)
-- DSP/channelization is fast to iterate (`numpy`, `scipy`)
-- Easy to adapt while validating RF settings on real hardware
-
-## Features implemented
-- Listens to all 16 PMR446 channels (12.5 kHz spacing)
-- Records all channels simultaneously into separate WAV files (`1.wav` ... `16.wav`)
-- Uses per-channel squelch based on a monitor channel at `445.993750 MHz` (below 446 MHz)
-- Each channel opens/closes independently vs that monitor reference
-- Starts/stops writing WAV audio depending on squelch open/close state
-- Closes WAV files and SDR device cleanly on termination (`Ctrl+C` / `SIGTERM`)
-- Channel 1 starts at 446.00625 MHz
-- Narrowband FM channelization (12.5 kHz channels)
+Scripts:
+- `pmr446_recorder.py`: PMR446 plan (16 channels)
+- `cb_recorder.py`: CB CEPT plan (40 channels)
 
 ## Install
 ```bash
@@ -24,34 +12,38 @@ python -m pip install -r requirements.txt
 ```
 
 ## Run
+PMR446:
 ```bash
-python pmr446_recorder.py --device-index 0 --output-dir recordings
+python pmr446_recorder.py --device 0 --output-dir recordings
 ```
 
-Optional tuning:
+CB:
+```bash
+python cb_recorder.py --device 0 --output-dir recordings-cb
+```
+
+## Features
+- Simultaneous channel recording into `1.wav ... N.wav`
+- Per-channel squelch (channels open/close independently)
+- Reference monitor channel below the band for squelch baseline
+- Clean shutdown (`Ctrl+C` / `SIGTERM`) closes all WAV files
+
+## Common options
 - `--gain 30`
-- `--sample-rate 256000`
+- `--sample-rate ...`
 - `--audio-rate 16000`
-- `--audio-gain 3.0` (boost/decrease output loudness)
+- `--audio-gain 3.0`
 - `--chunk-size 65536`
-- `--no-squelch` (record continuously)
+- `--no-squelch`
 - `--squelch-open-db 4`
 - `--squelch-close-db 2`
 - `--squelch-hold-ms 300`
 - `--squelch-cal-seconds 2.0`
 
-## Notes
-- An RTL-SDR with stable TCXO and decent front-end filtering is recommended.
-- If RF is distorted or noisy, lower `--gain`.
-- If WAV output is too quiet/loud, adjust `--audio-gain`.
-- If you use a different SDR, this can be adapted to SoapySDR in a follow-up.
+Use `--help` on either script for all options.
 
-## macOS/Homebrew `librtlsdr` issues
-If the recorder cannot find `librtlsdr` inside a venv, set:
-
+## macOS/Homebrew `librtlsdr`
+If needed:
 ```bash
 export RTLSDR_LIB_PATH=/opt/homebrew/lib/librtlsdr.dylib
 ```
-
-Then run the recorder again.
-The script now also auto-tries common Homebrew locations (`/opt/homebrew/lib` and `/usr/local/lib`).
