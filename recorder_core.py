@@ -33,8 +33,9 @@ class BandPlan:
 class ChannelState:
     number: int
     offset_hz: float
-    mixer_osc: complex
-    mixer_step: complex
+    coarse_bin_index: int
+    residual_osc: complex
+    residual_step: complex
     lpf_zi: np.ndarray
     prev_sample: complex
     deemp_last: float
@@ -280,10 +281,14 @@ class RuntimeConfig:
     freqs: List[float]
     center_hz: float
     decimation: int
+    coarse_decimation: int
+    coarse_sample_rate: int
+    post_decimation: int
     offsets: List[float]
-    squelch_offset: float
-    squelch_step: complex
-    lpf_taps: np.ndarray
+    bin_offsets: np.ndarray
+    monitor_bin_index: int
+    monitor_residual_step: complex
+    post_lpf_taps: np.ndarray
     squelch_hold_samples: int
     squelch_cal_samples: int
 
@@ -295,19 +300,38 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
     decimation = args.sample_rate // args.audio_rate
     if decimation < 2:
         raise ValueError("sample-rate/audio-rate decimation must be >= 2")
+    if decimation % 2 != 0:
+        raise ValueError("sample-rate/audio-rate decimation must be an even integer for the channelizer")
 
     freqs = channel_frequencies(plan)
     center_hz = (freqs[0] + freqs[-1]) / 2.0
     offsets = [f - center_hz for f in freqs]
     squelch_offset = plan.squelch_monitor_hz - center_hz
-    squelch_step = np.complex64(np.exp(-1j * (2.0 * np.pi * squelch_offset / args.sample_rate)))
     max_offset = max(abs(o) for o in offsets)
     max_capture_offset = max(max_offset, abs(squelch_offset))
     if max_capture_offset + (plan.channel_width_hz / 2.0) > (args.sample_rate / 2.0):
         raise ValueError("sample-rate too low to cover all channels and squelch monitor simultaneously; increase --sample-rate")
 
+    if decimation % 8 == 0:
+        coarse_decimation = 8
+    elif decimation % 4 == 0:
+        coarse_decimation = 4
+    else:
+        coarse_decimation = 2
+    coarse_sample_rate = args.sample_rate // coarse_decimation
+    post_decimation = decimation // coarse_decimation
+    if post_decimation < 1:
+        raise ValueError("internal channelizer post-decimation became invalid")
+
+    bin_offsets = np.fft.fftfreq(coarse_decimation, d=1.0 / args.sample_rate).astype(np.float32)
+
+    monitor_bin_index = int(np.argmin(np.abs(bin_offsets - squelch_offset)))
+    monitor_bin_center = float(bin_offsets[monitor_bin_index])
+    monitor_residual_hz = squelch_offset - monitor_bin_center
+    monitor_residual_step = np.complex64(np.exp(-1j * (2.0 * np.pi * monitor_residual_hz / coarse_sample_rate)))
+
     lpf_cutoff = min(6000.0, plan.channel_width_hz * 0.48)
-    lpf_taps = firwin(numtaps=129, cutoff=lpf_cutoff, fs=args.sample_rate).astype(np.float32)
+    post_lpf_taps = firwin(numtaps=65, cutoff=lpf_cutoff, fs=coarse_sample_rate).astype(np.float32)
     squelch_hold_samples = max(0, int(args.audio_rate * (args.squelch_hold_ms / 1000.0)))
     squelch_cal_samples = max(0, int(args.audio_rate * args.squelch_cal_seconds))
 
@@ -315,10 +339,14 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
         freqs=freqs,
         center_hz=center_hz,
         decimation=decimation,
+        coarse_decimation=coarse_decimation,
+        coarse_sample_rate=coarse_sample_rate,
+        post_decimation=post_decimation,
         offsets=offsets,
-        squelch_offset=squelch_offset,
-        squelch_step=squelch_step,
-        lpf_taps=lpf_taps,
+        bin_offsets=bin_offsets,
+        monitor_bin_index=monitor_bin_index,
+        monitor_residual_step=monitor_residual_step,
+        post_lpf_taps=post_lpf_taps,
         squelch_hold_samples=squelch_hold_samples,
         squelch_cal_samples=squelch_cal_samples,
     )
@@ -348,6 +376,7 @@ def _print_runtime_summary(args: argparse.Namespace, plan: BandPlan, cfg: Runtim
     print(f"Sample rate:        {args.sample_rate} sps")
     print(f"Audio/WAV rate:     {args.audio_rate} Hz")
     print(f"Decimation:         {cfg.decimation}x")
+    print(f"Channelizer:        {cfg.coarse_decimation}-way PFB + FFT, then {cfg.post_decimation}x post-decimation")
     if args.no_squelch:
         print("Squelch:            disabled (continuous recording)")
     else:
@@ -360,15 +389,19 @@ def _print_runtime_summary(args: argparse.Namespace, plan: BandPlan, cfg: Runtim
 
 def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[ChannelState]:
     # Each channel keeps independent DSP/squelch state so recording gates are per-channel.
-    zi_template = lfilter_zi(cfg.lpf_taps, [1.0]).astype(np.complex64)
+    zi_template = lfilter_zi(cfg.post_lpf_taps, [1.0]).astype(np.complex64)
     states: List[ChannelState] = []
     for i, off in enumerate(cfg.offsets, start=1):
+        coarse_bin_index = int(np.argmin(np.abs(cfg.bin_offsets - off)))
+        coarse_bin_center = float(cfg.bin_offsets[coarse_bin_index])
+        residual_hz = off - coarse_bin_center
         out = args.output_dir / f"{i}.wav"
         st = ChannelState(
             number=i,
             offset_hz=off,
-            mixer_osc=np.complex64(1.0 + 0.0j),
-            mixer_step=np.complex64(np.exp(-1j * (2.0 * np.pi * off / args.sample_rate))),
+            coarse_bin_index=coarse_bin_index,
+            residual_osc=np.complex64(1.0 + 0.0j),
+            residual_step=np.complex64(np.exp(-1j * (2.0 * np.pi * residual_hz / cfg.coarse_sample_rate))),
             lpf_zi=zi_template.copy(),
             prev_sample=0.0 + 0.0j,
             deemp_last=0.0,
@@ -383,8 +416,44 @@ def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[C
     return states
 
 
+class PolyphaseFftChannelizer:
+    def __init__(self, sample_rate: int, decimation: int, taps_per_phase: int = 16) -> None:
+        self.decimation = decimation
+        self.sample_rate = sample_rate
+        prototype_len = decimation * taps_per_phase
+        cutoff = (sample_rate / (2.0 * decimation)) * 0.90
+        prototype = firwin(numtaps=prototype_len, cutoff=cutoff, fs=sample_rate).astype(np.float32)
+        self.phase_taps = [prototype[p::decimation].astype(np.float32, copy=False) for p in range(decimation)]
+        self.phase_zis = [lfilter_zi(t, [1.0]).astype(np.complex64) for t in self.phase_taps]
+
+    def process(self, iq: np.ndarray) -> np.ndarray:
+        n_out = iq.size // self.decimation
+        if n_out == 0:
+            return np.zeros((self.decimation, 0), dtype=np.complex64)
+        used = iq[: n_out * self.decimation]
+        branches = np.empty((self.decimation, n_out), dtype=np.complex64)
+        for phase in range(self.decimation):
+            phase_input = used[phase:]
+            y, self.phase_zis[phase] = lfilter(self.phase_taps[phase], [1.0], phase_input, zi=self.phase_zis[phase])
+            branches[phase, :] = y[: n_out * self.decimation : self.decimation]
+        return np.fft.fft(branches, axis=0).astype(np.complex64, copy=False)
+
+
+def _extract_narrowband_channel(
+    coarse_bins: np.ndarray,
+    st: ChannelState,
+    lpf_taps: np.ndarray,
+    decimation: int,
+) -> np.ndarray:
+    coarse = coarse_bins[st.coarse_bin_index]
+    shifted, st.residual_osc = _mix_with_oscillator(coarse, np.complex64(st.residual_osc), np.complex64(st.residual_step))
+    filtered, st.lpf_zi = lfilter(lpf_taps, [1.0], shifted, zi=st.lpf_zi)
+    return filtered[::decimation]
+
+
 def _compute_monitor_db(
-    iq: np.ndarray,
+    coarse_bins: np.ndarray,
+    monitor_bin_index: int,
     mixer_osc: complex,
     mixer_step: complex,
     lpf_zi: np.ndarray,
@@ -392,23 +461,13 @@ def _compute_monitor_db(
     decimation: int,
 ) -> tuple[float, complex, np.ndarray]:
     # The monitor channel is treated as a local noise reference for squelch.
-    shifted_sq, next_osc = _mix_with_oscillator(iq, np.complex64(mixer_osc), np.complex64(mixer_step))
+    monitor_stream = coarse_bins[monitor_bin_index]
+    shifted_sq, next_osc = _mix_with_oscillator(monitor_stream, np.complex64(mixer_osc), np.complex64(mixer_step))
     filtered_sq, next_zi = lfilter(lpf_taps, [1.0], shifted_sq, zi=lpf_zi)
     narrow_sq = filtered_sq[::decimation]
     monitor_power = float(np.mean(np.abs(narrow_sq) ** 2)) if narrow_sq.size else 0.0
     monitor_db = 10.0 * math.log10(max(monitor_power, 1e-12))
     return monitor_db, next_osc, next_zi
-
-
-def _extract_narrowband_channel(
-    iq: np.ndarray,
-    st: ChannelState,
-    lpf_taps: np.ndarray,
-    decimation: int,
-) -> np.ndarray:
-    shifted, st.mixer_osc = _mix_with_oscillator(iq, np.complex64(st.mixer_osc), np.complex64(st.mixer_step))
-    filtered, st.lpf_zi = lfilter(lpf_taps, [1.0], shifted, zi=st.lpf_zi)
-    return filtered[::decimation]
 
 
 def _mix_with_oscillator(iq: np.ndarray, mixer_osc: np.complex64, mixer_step: np.complex64) -> tuple[np.ndarray, np.complex64]:
@@ -538,7 +597,8 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
         states = _init_channel_states(args, cfg)
 
         # 2) Initialize monitor DSP state used as squelch reference.
-        zi_template = lfilter_zi(cfg.lpf_taps, [1.0]).astype(np.complex64)
+        channelizer = PolyphaseFftChannelizer(sample_rate=args.sample_rate, decimation=cfg.coarse_decimation)
+        zi_template = lfilter_zi(cfg.post_lpf_taps, [1.0]).astype(np.complex64)
         monitor_mixer_osc = np.complex64(1.0 + 0.0j)
         monitor_lpf_zi = zi_template.copy()
 
@@ -548,24 +608,28 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
             n = iq.size
             if n == 0:
                 continue
+            coarse_bins = channelizer.process(iq)
+            if coarse_bins.shape[1] == 0:
+                continue
 
             monitor_db = 0.0
             if not args.no_squelch:
                 monitor_db, monitor_mixer_osc, monitor_lpf_zi = _compute_monitor_db(
-                    iq=iq,
+                    coarse_bins=coarse_bins,
+                    monitor_bin_index=cfg.monitor_bin_index,
                     mixer_osc=monitor_mixer_osc,
-                    mixer_step=cfg.squelch_step,
+                    mixer_step=cfg.monitor_residual_step,
                     lpf_zi=monitor_lpf_zi,
-                    lpf_taps=cfg.lpf_taps,
-                    decimation=cfg.decimation,
+                    lpf_taps=cfg.post_lpf_taps,
+                    decimation=cfg.post_decimation,
                 )
 
             for st in states:
                 narrow = _extract_narrowband_channel(
-                    iq=iq,
+                    coarse_bins=coarse_bins,
                     st=st,
-                    lpf_taps=cfg.lpf_taps,
-                    decimation=cfg.decimation,
+                    lpf_taps=cfg.post_lpf_taps,
+                    decimation=cfg.post_decimation,
                 )
 
                 if not args.no_squelch:
