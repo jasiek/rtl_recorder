@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from functools import lru_cache
 import math
 import os
 import signal
@@ -32,7 +33,8 @@ class BandPlan:
 class ChannelState:
     number: int
     offset_hz: float
-    mixer_phase: float
+    mixer_osc: complex
+    mixer_step: complex
     lpf_zi: np.ndarray
     prev_sample: complex
     deemp_last: float
@@ -122,6 +124,8 @@ class CompatRtlSdr:
         if rc != 0:
             raise RuntimeError(f"rtlsdr_open failed with code {rc}")
         self._closed = False
+        self._read_buf = None
+        self._read_buf_len = 0
         self.lib.rtlsdr_reset_buffer(self.dev)
 
     def _setup_api(self) -> None:
@@ -199,7 +203,10 @@ class CompatRtlSdr:
 
     def read_samples(self, count: int) -> np.ndarray:
         byte_count = int(count) * 2
-        buf = (ctypes.c_ubyte * byte_count)()
+        if self._read_buf is None or self._read_buf_len != byte_count:
+            self._read_buf = (ctypes.c_ubyte * byte_count)()
+            self._read_buf_len = byte_count
+        buf = self._read_buf
         n_read = ctypes.c_int(0)
         rc = self.lib.rtlsdr_read_sync(self.dev, buf, byte_count, ctypes.byref(n_read))
         if rc != 0:
@@ -255,14 +262,17 @@ def fm_demod(samples: np.ndarray, prev: complex) -> tuple[np.ndarray, complex]:
 def deemphasis(x: np.ndarray, fs: float, tau_s: float, y_last: float) -> tuple[np.ndarray, float]:
     if x.size == 0:
         return x, y_last
+    b, a = _deemphasis_coeffs(float(fs), float(tau_s))
+    y, zf = lfilter(b, a, x.astype(np.float32, copy=False), zi=np.array([y_last], dtype=np.float32))
+    return y.astype(np.float32, copy=False), float(zf[0])
+
+
+@lru_cache(maxsize=8)
+def _deemphasis_coeffs(fs: float, tau_s: float) -> tuple[np.ndarray, np.ndarray]:
     alpha = math.exp(-1.0 / (fs * tau_s))
-    y = np.empty_like(x, dtype=np.float32)
-    prev = y_last
-    one_minus = 1.0 - alpha
-    for i in range(x.size):
-        prev = alpha * prev + one_minus * float(x[i])
-        y[i] = prev
-    return y, prev
+    b = np.array([1.0 - alpha], dtype=np.float32)
+    a = np.array([1.0, -alpha], dtype=np.float32)
+    return b, a
 
 
 @dataclass(frozen=True)
@@ -272,6 +282,7 @@ class RuntimeConfig:
     decimation: int
     offsets: List[float]
     squelch_offset: float
+    squelch_step: complex
     lpf_taps: np.ndarray
     squelch_hold_samples: int
     squelch_cal_samples: int
@@ -289,6 +300,7 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
     center_hz = (freqs[0] + freqs[-1]) / 2.0
     offsets = [f - center_hz for f in freqs]
     squelch_offset = plan.squelch_monitor_hz - center_hz
+    squelch_step = np.complex64(np.exp(-1j * (2.0 * np.pi * squelch_offset / args.sample_rate)))
     max_offset = max(abs(o) for o in offsets)
     max_capture_offset = max(max_offset, abs(squelch_offset))
     if max_capture_offset + (plan.channel_width_hz / 2.0) > (args.sample_rate / 2.0):
@@ -305,6 +317,7 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
         decimation=decimation,
         offsets=offsets,
         squelch_offset=squelch_offset,
+        squelch_step=squelch_step,
         lpf_taps=lpf_taps,
         squelch_hold_samples=squelch_hold_samples,
         squelch_cal_samples=squelch_cal_samples,
@@ -354,7 +367,8 @@ def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[C
         st = ChannelState(
             number=i,
             offset_hz=off,
-            mixer_phase=0.0,
+            mixer_osc=np.complex64(1.0 + 0.0j),
+            mixer_step=np.complex64(np.exp(-1j * (2.0 * np.pi * off / args.sample_rate))),
             lpf_zi=zi_template.copy(),
             prev_sample=0.0 + 0.0j,
             deemp_last=0.0,
@@ -371,42 +385,44 @@ def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[C
 
 def _compute_monitor_db(
     iq: np.ndarray,
-    idx: np.ndarray,
-    mixer_phase: float,
+    mixer_osc: complex,
+    mixer_step: complex,
     lpf_zi: np.ndarray,
-    squelch_offset: float,
-    sample_rate: int,
     lpf_taps: np.ndarray,
     decimation: int,
-) -> tuple[float, float, np.ndarray]:
+) -> tuple[float, complex, np.ndarray]:
     # The monitor channel is treated as a local noise reference for squelch.
-    w_sq = 2.0 * np.pi * squelch_offset / sample_rate
-    phases_sq = mixer_phase + w_sq * idx
-    mixer_sq = np.exp(-1j * phases_sq).astype(np.complex64)
-    shifted_sq = iq * mixer_sq
-    next_phase = float((phases_sq[-1] + w_sq) % (2.0 * np.pi))
+    shifted_sq, next_osc = _mix_with_oscillator(iq, np.complex64(mixer_osc), np.complex64(mixer_step))
     filtered_sq, next_zi = lfilter(lpf_taps, [1.0], shifted_sq, zi=lpf_zi)
     narrow_sq = filtered_sq[::decimation]
     monitor_power = float(np.mean(np.abs(narrow_sq) ** 2)) if narrow_sq.size else 0.0
     monitor_db = 10.0 * math.log10(max(monitor_power, 1e-12))
-    return monitor_db, next_phase, next_zi
+    return monitor_db, next_osc, next_zi
 
 
 def _extract_narrowband_channel(
     iq: np.ndarray,
-    idx: np.ndarray,
     st: ChannelState,
-    sample_rate: int,
     lpf_taps: np.ndarray,
     decimation: int,
 ) -> np.ndarray:
-    w = 2.0 * np.pi * st.offset_hz / sample_rate
-    phases = st.mixer_phase + w * idx
-    mixer = np.exp(-1j * phases).astype(np.complex64)
-    shifted = iq * mixer
-    st.mixer_phase = float((phases[-1] + w) % (2.0 * np.pi))
+    shifted, st.mixer_osc = _mix_with_oscillator(iq, np.complex64(st.mixer_osc), np.complex64(st.mixer_step))
     filtered, st.lpf_zi = lfilter(lpf_taps, [1.0], shifted, zi=st.lpf_zi)
     return filtered[::decimation]
+
+
+def _mix_with_oscillator(iq: np.ndarray, mixer_osc: np.complex64, mixer_step: np.complex64) -> tuple[np.ndarray, np.complex64]:
+    n = iq.size
+    if n == 0:
+        return iq, mixer_osc
+    mixer = np.empty(n, dtype=np.complex64)
+    mixer[0] = mixer_osc
+    if n > 1:
+        mixer[1:] = mixer_step
+        np.cumprod(mixer, out=mixer)
+    shifted = iq * mixer
+    next_osc = np.complex64(mixer[-1] * mixer_step)
+    return shifted, next_osc
 
 
 def _channel_should_record(
@@ -523,7 +539,7 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
 
         # 2) Initialize monitor DSP state used as squelch reference.
         zi_template = lfilter_zi(cfg.lpf_taps, [1.0]).astype(np.complex64)
-        monitor_mixer_phase = 0.0
+        monitor_mixer_osc = np.complex64(1.0 + 0.0j)
         monitor_lpf_zi = zi_template.copy()
 
         # 3) Stream IQ chunks, evaluate squelch, and write per-channel WAV audio.
@@ -532,17 +548,14 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
             n = iq.size
             if n == 0:
                 continue
-            idx = np.arange(n, dtype=np.float32)
 
             monitor_db = 0.0
             if not args.no_squelch:
-                monitor_db, monitor_mixer_phase, monitor_lpf_zi = _compute_monitor_db(
+                monitor_db, monitor_mixer_osc, monitor_lpf_zi = _compute_monitor_db(
                     iq=iq,
-                    idx=idx,
-                    mixer_phase=monitor_mixer_phase,
+                    mixer_osc=monitor_mixer_osc,
+                    mixer_step=cfg.squelch_step,
                     lpf_zi=monitor_lpf_zi,
-                    squelch_offset=cfg.squelch_offset,
-                    sample_rate=args.sample_rate,
                     lpf_taps=cfg.lpf_taps,
                     decimation=cfg.decimation,
                 )
@@ -550,9 +563,7 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
             for st in states:
                 narrow = _extract_narrowband_channel(
                     iq=iq,
-                    idx=idx,
                     st=st,
-                    sample_rate=args.sample_rate,
                     lpf_taps=cfg.lpf_taps,
                     decimation=cfg.decimation,
                 )
