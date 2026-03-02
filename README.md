@@ -4,7 +4,7 @@ Python implementation for recording PMR446 channels 1-16 from a single USB RTL-S
 
 ## Why Python
 Python is the most practical choice for this first version because:
-- USB RTL-SDR access is straightforward (`pyrtlsdr`)
+- USB RTL-SDR access is straightforward (direct `ctypes` to `librtlsdr`)
 - DSP/channelization is fast to iterate (`numpy`, `scipy`)
 - Easy to adapt while validating RF settings on real hardware
 
@@ -35,3 +35,13 @@ Optional tuning:
 - An RTL-SDR with stable TCXO and decent front-end filtering is recommended.
 - If audio is distorted, lower `--gain`.
 - If you use a different SDR, this can be adapted to SoapySDR in a follow-up.
+
+## macOS/Homebrew `librtlsdr` issues
+If the recorder cannot find `librtlsdr` inside a venv, set:
+
+```bash
+export RTLSDR_LIB_PATH=/opt/homebrew/lib/librtlsdr.dylib
+```
+
+Then run the recorder again.  
+The script now also auto-tries common Homebrew locations (`/opt/homebrew/lib` and `/usr/local/lib`).
