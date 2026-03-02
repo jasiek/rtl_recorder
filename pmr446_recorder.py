@@ -26,6 +26,7 @@ CHANNEL_COUNT = 16
 FIRST_CHANNEL_HZ = 446_006_250.0
 CHANNEL_SPACING_HZ = 12_500.0
 CHANNEL_WIDTH_HZ = 12_500.0
+SQUELCH_MONITOR_HZ = 445_993_750.0
 
 
 @dataclass
@@ -37,6 +38,10 @@ class ChannelState:
     prev_sample: complex
     deemp_last: float
     wav: wave.Wave_write
+    squelch_open: bool
+    squelch_hold_samples: int
+    squelch_delta_floor_db: float | None
+    squelch_cal_remaining_samples: int
 
 
 running = True
@@ -271,6 +276,35 @@ def main() -> int:
     parser.add_argument("--sample-rate", type=int, default=256_000, help="SDR sample rate (default: 256000)")
     parser.add_argument("--audio-rate", type=int, default=16_000, help="Per-channel WAV sample rate (default: 16000)")
     parser.add_argument("--chunk-size", type=int, default=65_536, help="IQ samples per read (default: 65536)")
+    parser.add_argument(
+        "--no-squelch",
+        action="store_true",
+        help="Disable squelch logic and record continuously",
+    )
+    parser.add_argument(
+        "--squelch-open-db",
+        type=float,
+        default=4.0,
+        help="Per-channel: open when channel power rises this many dB above monitor channel power (default: 4)",
+    )
+    parser.add_argument(
+        "--squelch-close-db",
+        type=float,
+        default=2.0,
+        help="Per-channel: close when channel power falls below this many dB above monitor channel power (default: 2)",
+    )
+    parser.add_argument(
+        "--squelch-hold-ms",
+        type=int,
+        default=300,
+        help="Hold squelch open this long after signal drops (default: 300 ms)",
+    )
+    parser.add_argument(
+        "--squelch-cal-seconds",
+        type=float,
+        default=2.0,
+        help="Initial squelch calibration duration while forced closed (default: 2.0 s)",
+    )
     args = parser.parse_args()
 
     if args.sample_rate % args.audio_rate != 0:
@@ -286,10 +320,12 @@ def main() -> int:
     freqs = channel_frequencies()
     center_hz = (freqs[0] + freqs[-1]) / 2.0
     offsets = [f - center_hz for f in freqs]
+    squelch_offset = SQUELCH_MONITOR_HZ - center_hz
     max_offset = max(abs(o) for o in offsets)
-    if max_offset + (CHANNEL_WIDTH_HZ / 2.0) > (args.sample_rate / 2.0):
+    max_capture_offset = max(max_offset, abs(squelch_offset))
+    if max_capture_offset + (CHANNEL_WIDTH_HZ / 2.0) > (args.sample_rate / 2.0):
         print(
-            "sample-rate too low to cover all 16 channels simultaneously; "
+            "sample-rate too low to cover all channels and squelch monitor simultaneously; "
             "increase --sample-rate",
             file=sys.stderr,
         )
@@ -299,6 +335,8 @@ def main() -> int:
 
     # Channel extraction low-pass before decimation (12.5 kHz channel; keep ~5 kHz useful audio/deviation).
     lpf_taps = firwin(numtaps=129, cutoff=6_000, fs=args.sample_rate).astype(np.float32)
+    squelch_hold_samples = max(0, int(args.audio_rate * (args.squelch_hold_ms / 1000.0)))
+    squelch_cal_samples = max(0, int(args.audio_rate * args.squelch_cal_seconds))
 
     sdr = None
     states: List[ChannelState] = []
@@ -328,9 +366,19 @@ def main() -> int:
         print(f"Sample rate:        {args.sample_rate} sps")
         print(f"Audio/WAV rate:     {args.audio_rate} Hz")
         print(f"Decimation:         {decimation}x")
+        if args.no_squelch:
+            print("Squelch:            disabled (continuous recording)")
+        else:
+            print(
+                f"Squelch monitor:    {SQUELCH_MONITOR_HZ / 1e6:.6f} MHz "
+                f"(reference below 446 MHz; per-channel open +{args.squelch_open_db:.1f} dB, "
+                f"close +{args.squelch_close_db:.1f} dB above adaptive baseline, hold {args.squelch_hold_ms} ms)"
+            )
         print("Recording channels:")
 
         zi_template = lfilter_zi(lpf_taps, [1.0]).astype(np.complex64)
+        monitor_mixer_phase = 0.0
+        monitor_lpf_zi = zi_template.copy()
         for i, off in enumerate(offsets, start=1):
             wav = open_wav(args.output_dir / f"{i}.wav", args.audio_rate)
             st = ChannelState(
@@ -341,6 +389,10 @@ def main() -> int:
                 prev_sample=0.0 + 0.0j,
                 deemp_last=0.0,
                 wav=wav,
+                squelch_open=False,
+                squelch_hold_samples=0,
+                squelch_delta_floor_db=None,
+                squelch_cal_remaining_samples=squelch_cal_samples,
             )
             states.append(st)
             print(f"  CH {i:02d}: {freqs[i - 1] / 1e6:.5f} MHz -> {(args.output_dir / f'{i}.wav')}")
@@ -352,6 +404,20 @@ def main() -> int:
                 continue
 
             idx = np.arange(n, dtype=np.float32)
+
+            monitor_db = 0.0
+            if not args.no_squelch:
+                # Monitor-channel reference below 446 MHz.
+                w_sq = 2.0 * np.pi * squelch_offset / args.sample_rate
+                phases_sq = monitor_mixer_phase + w_sq * idx
+                mixer_sq = np.exp(-1j * phases_sq).astype(np.complex64)
+                shifted_sq = iq * mixer_sq
+                monitor_mixer_phase = float((phases_sq[-1] + w_sq) % (2.0 * np.pi))
+                filtered_sq, monitor_lpf_zi = lfilter(lpf_taps, [1.0], shifted_sq, zi=monitor_lpf_zi)
+                narrow_sq = filtered_sq[::decimation]
+                monitor_power = float(np.mean(np.abs(narrow_sq) ** 2)) if narrow_sq.size else 0.0
+                monitor_db = 10.0 * math.log10(max(monitor_power, 1e-12))
+
             for st in states:
                 w = 2.0 * np.pi * st.offset_hz / args.sample_rate
                 phases = st.mixer_phase + w * idx
@@ -361,6 +427,51 @@ def main() -> int:
 
                 filtered, st.lpf_zi = lfilter(lpf_taps, [1.0], shifted, zi=st.lpf_zi)
                 narrow = filtered[::decimation]
+                if not args.no_squelch:
+                    chunk_audio_samples = len(narrow)
+                    ch_power = float(np.mean(np.abs(narrow) ** 2)) if narrow.size else 0.0
+                    ch_db = 10.0 * math.log10(max(ch_power, 1e-12))
+                    delta_db = ch_db - monitor_db
+
+                    if st.squelch_delta_floor_db is None:
+                        st.squelch_delta_floor_db = delta_db
+
+                    # Force closed during per-channel startup calibration.
+                    if st.squelch_cal_remaining_samples > 0:
+                        st.squelch_cal_remaining_samples -= chunk_audio_samples
+                        st.squelch_delta_floor_db = 0.98 * st.squelch_delta_floor_db + 0.02 * delta_db
+                        st.squelch_open = False
+                        if narrow.size:
+                            st.prev_sample = narrow[-1]
+                        continue
+
+                    if not st.squelch_open:
+                        st.squelch_delta_floor_db = 0.98 * st.squelch_delta_floor_db + 0.02 * delta_db
+
+                    open_threshold = st.squelch_delta_floor_db + args.squelch_open_db
+                    close_threshold = st.squelch_delta_floor_db + args.squelch_close_db
+
+                    if not st.squelch_open and delta_db >= open_threshold:
+                        st.squelch_open = True
+                        st.squelch_hold_samples = squelch_hold_samples
+                        print(
+                            f"Squelch OPEN  (CH {st.number:02d}, delta {delta_db:.1f} dB, baseline {st.squelch_delta_floor_db:.1f} dB)"
+                        )
+                    elif st.squelch_open:
+                        if delta_db < close_threshold:
+                            st.squelch_hold_samples -= chunk_audio_samples
+                            if st.squelch_hold_samples <= 0:
+                                st.squelch_open = False
+                                print(
+                                    f"Squelch CLOSE (CH {st.number:02d}, delta {delta_db:.1f} dB, baseline {st.squelch_delta_floor_db:.1f} dB)"
+                                )
+                        else:
+                            st.squelch_hold_samples = squelch_hold_samples
+
+                    if not st.squelch_open:
+                        if narrow.size:
+                            st.prev_sample = narrow[-1]
+                        continue
 
                 demod, st.prev_sample = fm_demod(narrow, st.prev_sample)
                 audio, st.deemp_last = deemphasis(demod, args.audio_rate, 50e-6, st.deemp_last)

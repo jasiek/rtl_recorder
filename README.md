@@ -11,6 +11,9 @@ Python is the most practical choice for this first version because:
 ## Features implemented
 - Listens to all 16 PMR446 channels (12.5 kHz spacing)
 - Records all channels simultaneously into separate WAV files (`1.wav` ... `16.wav`)
+- Uses per-channel squelch based on a monitor channel at `445.993750 MHz` (below 446 MHz)
+- Each channel opens/closes independently vs that monitor reference
+- Starts/stops writing WAV audio depending on squelch open/close state
 - Closes WAV files and SDR device cleanly on termination (`Ctrl+C` / `SIGTERM`)
 - Channel 1 starts at 446.00625 MHz
 - Narrowband FM channelization (12.5 kHz channels)
@@ -30,6 +33,11 @@ Optional tuning:
 - `--sample-rate 256000`
 - `--audio-rate 16000`
 - `--chunk-size 65536`
+- `--no-squelch` (record continuously)
+- `--squelch-open-db 4`
+- `--squelch-close-db 2`
+- `--squelch-hold-ms 300`
+- `--squelch-cal-seconds 2.0`
 
 ## Notes
 - An RTL-SDR with stable TCXO and decent front-end filtering is recommended.
