@@ -277,6 +277,12 @@ def main() -> int:
     parser.add_argument("--audio-rate", type=int, default=16_000, help="Per-channel WAV sample rate (default: 16000)")
     parser.add_argument("--chunk-size", type=int, default=65_536, help="IQ samples per read (default: 65536)")
     parser.add_argument(
+        "--audio-gain",
+        type=float,
+        default=3.0,
+        help="Post-demod audio gain multiplier before WAV conversion (default: 3.0)",
+    )
+    parser.add_argument(
         "--no-squelch",
         action="store_true",
         help="Disable squelch logic and record continuously",
@@ -476,7 +482,10 @@ def main() -> int:
                 demod, st.prev_sample = fm_demod(narrow, st.prev_sample)
                 audio, st.deemp_last = deemphasis(demod, args.audio_rate, 50e-6, st.deemp_last)
 
-                audio *= 9000.0
+                # Remove per-chunk DC bias and apply user gain.
+                if audio.size:
+                    audio = audio - float(np.mean(audio))
+                audio *= 9000.0 * args.audio_gain
                 pcm = np.clip(audio, -32768, 32767).astype(np.int16)
                 st.wav.writeframes(pcm.tobytes())
 

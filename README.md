@@ -32,6 +32,7 @@ Optional tuning:
 - `--gain 30`
 - `--sample-rate 256000`
 - `--audio-rate 16000`
+- `--audio-gain 3.0` (boost/decrease output loudness)
 - `--chunk-size 65536`
 - `--no-squelch` (record continuously)
 - `--squelch-open-db 4`
@@ -41,7 +42,8 @@ Optional tuning:
 
 ## Notes
 - An RTL-SDR with stable TCXO and decent front-end filtering is recommended.
-- If audio is distorted, lower `--gain`.
+- If RF is distorted or noisy, lower `--gain`.
+- If WAV output is too quiet/loud, adjust `--audio-gain`.
 - If you use a different SDR, this can be adapted to SoapySDR in a follow-up.
 
 ## macOS/Homebrew `librtlsdr` issues
@@ -51,5 +53,5 @@ If the recorder cannot find `librtlsdr` inside a venv, set:
 export RTLSDR_LIB_PATH=/opt/homebrew/lib/librtlsdr.dylib
 ```
 
-Then run the recorder again.  
+Then run the recorder again.
 The script now also auto-tries common Homebrew locations (`/opt/homebrew/lib` and `/usr/local/lib`).
