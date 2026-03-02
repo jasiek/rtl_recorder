@@ -43,6 +43,7 @@ class ChannelState:
     squelch_open: bool
     squelch_hold_samples: int
     squelch_delta_floor_db: float | None
+    coarse_delta_floor_db: float | None
     squelch_cal_remaining_samples: int
 
 
@@ -382,7 +383,7 @@ def _print_runtime_summary(args: argparse.Namespace, plan: BandPlan, cfg: Runtim
     else:
         print(
             f"Squelch monitor:    {plan.squelch_monitor_hz / 1e6:.6f} MHz "
-            f"(per-channel open +{args.squelch_open_db:.1f} dB, close +{args.squelch_close_db:.1f} dB)"
+            f"(coarse pre-open +{args.squelch_coarse_open_db:.1f} dB, fine open +{args.squelch_open_db:.1f} dB, close +{args.squelch_close_db:.1f} dB)"
         )
     print("Recording channels:")
 
@@ -409,6 +410,7 @@ def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[C
             squelch_open=False,
             squelch_hold_samples=0,
             squelch_delta_floor_db=None,
+            coarse_delta_floor_db=None,
             squelch_cal_remaining_samples=cfg.squelch_cal_samples,
         )
         states.append(st)
@@ -465,8 +467,7 @@ def _compute_monitor_db(
     shifted_sq, next_osc = _mix_with_oscillator(monitor_stream, np.complex64(mixer_osc), np.complex64(mixer_step))
     filtered_sq, next_zi = lfilter(lpf_taps, [1.0], shifted_sq, zi=lpf_zi)
     narrow_sq = filtered_sq[::decimation]
-    monitor_power = float(np.mean(np.abs(narrow_sq) ** 2)) if narrow_sq.size else 0.0
-    monitor_db = 10.0 * math.log10(max(monitor_power, 1e-12))
+    monitor_db = _power_db(narrow_sq)
     return monitor_db, next_osc, next_zi
 
 
@@ -484,6 +485,31 @@ def _mix_with_oscillator(iq: np.ndarray, mixer_osc: np.complex64, mixer_step: np
     return shifted, next_osc
 
 
+def _power_db(samples: np.ndarray) -> float:
+    if samples.size == 0:
+        return -120.0
+    power = float(np.vdot(samples, samples).real / samples.size)
+    return 10.0 * math.log10(max(power, 1e-12))
+
+
+def _coarse_should_process_channel(
+    st: ChannelState,
+    coarse_stream: np.ndarray,
+    monitor_coarse_db: float,
+    args: argparse.Namespace,
+) -> bool:
+    coarse_delta_db = _power_db(coarse_stream) - monitor_coarse_db
+    if st.coarse_delta_floor_db is None:
+        st.coarse_delta_floor_db = coarse_delta_db
+
+    if st.squelch_open or st.squelch_cal_remaining_samples > 0:
+        return True
+
+    st.coarse_delta_floor_db = 0.98 * st.coarse_delta_floor_db + 0.02 * coarse_delta_db
+    coarse_open_threshold = st.coarse_delta_floor_db + args.squelch_coarse_open_db
+    return coarse_delta_db >= coarse_open_threshold
+
+
 def _channel_should_record(
     st: ChannelState,
     narrow: np.ndarray,
@@ -492,8 +518,7 @@ def _channel_should_record(
     squelch_hold_samples: int,
 ) -> bool:
     chunk_audio_samples = len(narrow)
-    ch_power = float(np.mean(np.abs(narrow) ** 2)) if narrow.size else 0.0
-    ch_db = 10.0 * math.log10(max(ch_power, 1e-12))
+    ch_db = _power_db(narrow)
     delta_db = ch_db - monitor_db
 
     if st.squelch_delta_floor_db is None:
@@ -567,6 +592,12 @@ def build_parser(plan: BandPlan) -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, default=65_536, help="IQ samples per read (default: 65536)")
     p.add_argument("--audio-gain", type=float, default=3.0, help="Post-demod audio gain multiplier before WAV conversion (default: 3.0)")
     p.add_argument("--no-squelch", action="store_true", help="Disable squelch logic and record continuously")
+    p.add_argument(
+        "--squelch-coarse-open-db",
+        type=float,
+        default=2.0,
+        help="First-stage gate: run full per-channel DSP only when coarse channel power exceeds baseline by this many dB (default: 2.0)",
+    )
     p.add_argument("--squelch-open-db", type=float, default=4.0, help="Per-channel: open when channel power rises this many dB above monitor channel power (default: 4)")
     p.add_argument("--squelch-close-db", type=float, default=2.0, help="Per-channel: close when channel power falls below this many dB above monitor channel power (default: 2)")
     p.add_argument("--squelch-hold-ms", type=int, default=300, help="Hold squelch open this long after signal drops (default: 300 ms)")
@@ -613,7 +644,9 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
                 continue
 
             monitor_db = 0.0
+            monitor_coarse_db = 0.0
             if not args.no_squelch:
+                monitor_coarse_db = _power_db(coarse_bins[cfg.monitor_bin_index])
                 monitor_db, monitor_mixer_osc, monitor_lpf_zi = _compute_monitor_db(
                     coarse_bins=coarse_bins,
                     monitor_bin_index=cfg.monitor_bin_index,
@@ -625,6 +658,16 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
                 )
 
             for st in states:
+                if not args.no_squelch:
+                    coarse_stream = coarse_bins[st.coarse_bin_index]
+                    if not _coarse_should_process_channel(
+                        st=st,
+                        coarse_stream=coarse_stream,
+                        monitor_coarse_db=monitor_coarse_db,
+                        args=args,
+                    ):
+                        continue
+
                 narrow = _extract_narrowband_channel(
                     coarse_bins=coarse_bins,
                     st=st,
