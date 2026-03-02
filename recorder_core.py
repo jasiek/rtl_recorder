@@ -36,7 +36,8 @@ class ChannelState:
     coarse_bin_index: int
     residual_osc: complex
     residual_step: complex
-    lpf_zi: np.ndarray
+    post1_zi: np.ndarray
+    post2_zi: np.ndarray
     prev_sample: complex
     deemp_last: float
     wav: wave.Wave_write
@@ -285,11 +286,14 @@ class RuntimeConfig:
     coarse_decimation: int
     coarse_sample_rate: int
     post_decimation: int
+    post_decimation_stage1: int
+    post_decimation_stage2: int
     offsets: List[float]
     bin_offsets: np.ndarray
     monitor_bin_index: int
     monitor_residual_step: complex
-    post_lpf_taps: np.ndarray
+    post1_lpf_taps: np.ndarray
+    post2_lpf_taps: np.ndarray
     squelch_hold_samples: int
     squelch_cal_samples: int
 
@@ -323,6 +327,13 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
     post_decimation = decimation // coarse_decimation
     if post_decimation < 1:
         raise ValueError("internal channelizer post-decimation became invalid")
+    if post_decimation % 4 == 0:
+        post_decimation_stage1 = 4
+    elif post_decimation % 2 == 0:
+        post_decimation_stage1 = 2
+    else:
+        post_decimation_stage1 = 1
+    post_decimation_stage2 = post_decimation // post_decimation_stage1
 
     bin_offsets = np.fft.fftfreq(coarse_decimation, d=1.0 / args.sample_rate).astype(np.float32)
 
@@ -332,7 +343,9 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
     monitor_residual_step = np.complex64(np.exp(-1j * (2.0 * np.pi * monitor_residual_hz / coarse_sample_rate)))
 
     lpf_cutoff = min(6000.0, plan.channel_width_hz * 0.48)
-    post_lpf_taps = firwin(numtaps=65, cutoff=lpf_cutoff, fs=coarse_sample_rate).astype(np.float32)
+    post1_lpf_taps = firwin(numtaps=33, cutoff=lpf_cutoff, fs=coarse_sample_rate).astype(np.float32)
+    post2_sample_rate = coarse_sample_rate // post_decimation_stage1
+    post2_lpf_taps = firwin(numtaps=33, cutoff=lpf_cutoff, fs=post2_sample_rate).astype(np.float32)
     squelch_hold_samples = max(0, int(args.audio_rate * (args.squelch_hold_ms / 1000.0)))
     squelch_cal_samples = max(0, int(args.audio_rate * args.squelch_cal_seconds))
 
@@ -343,11 +356,14 @@ def _build_runtime_config(args: argparse.Namespace, plan: BandPlan) -> RuntimeCo
         coarse_decimation=coarse_decimation,
         coarse_sample_rate=coarse_sample_rate,
         post_decimation=post_decimation,
+        post_decimation_stage1=post_decimation_stage1,
+        post_decimation_stage2=post_decimation_stage2,
         offsets=offsets,
         bin_offsets=bin_offsets,
         monitor_bin_index=monitor_bin_index,
         monitor_residual_step=monitor_residual_step,
-        post_lpf_taps=post_lpf_taps,
+        post1_lpf_taps=post1_lpf_taps,
+        post2_lpf_taps=post2_lpf_taps,
         squelch_hold_samples=squelch_hold_samples,
         squelch_cal_samples=squelch_cal_samples,
     )
@@ -377,7 +393,10 @@ def _print_runtime_summary(args: argparse.Namespace, plan: BandPlan, cfg: Runtim
     print(f"Sample rate:        {args.sample_rate} sps")
     print(f"Audio/WAV rate:     {args.audio_rate} Hz")
     print(f"Decimation:         {cfg.decimation}x")
-    print(f"Channelizer:        {cfg.coarse_decimation}-way PFB + FFT, then {cfg.post_decimation}x post-decimation")
+    print(
+        f"Channelizer:        {cfg.coarse_decimation}-way PFB + FFT, then "
+        f"{cfg.post_decimation_stage1}x/{cfg.post_decimation_stage2}x post-decimation"
+    )
     if args.no_squelch:
         print("Squelch:            disabled (continuous recording)")
     else:
@@ -390,7 +409,8 @@ def _print_runtime_summary(args: argparse.Namespace, plan: BandPlan, cfg: Runtim
 
 def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[ChannelState]:
     # Each channel keeps independent DSP/squelch state so recording gates are per-channel.
-    zi_template = lfilter_zi(cfg.post_lpf_taps, [1.0]).astype(np.complex64)
+    post1_zi_template = lfilter_zi(cfg.post1_lpf_taps, [1.0]).astype(np.complex64)
+    post2_zi_template = lfilter_zi(cfg.post2_lpf_taps, [1.0]).astype(np.complex64)
     states: List[ChannelState] = []
     for i, off in enumerate(cfg.offsets, start=1):
         coarse_bin_index = int(np.argmin(np.abs(cfg.bin_offsets - off)))
@@ -403,7 +423,8 @@ def _init_channel_states(args: argparse.Namespace, cfg: RuntimeConfig) -> List[C
             coarse_bin_index=coarse_bin_index,
             residual_osc=np.complex64(1.0 + 0.0j),
             residual_step=np.complex64(np.exp(-1j * (2.0 * np.pi * residual_hz / cfg.coarse_sample_rate))),
-            lpf_zi=zi_template.copy(),
+            post1_zi=post1_zi_template.copy(),
+            post2_zi=post2_zi_template.copy(),
             prev_sample=0.0 + 0.0j,
             deemp_last=0.0,
             wav=open_wav(out, args.audio_rate),
@@ -444,13 +465,22 @@ class PolyphaseFftChannelizer:
 def _extract_narrowband_channel(
     coarse_bins: np.ndarray,
     st: ChannelState,
-    lpf_taps: np.ndarray,
-    decimation: int,
+    post1_lpf_taps: np.ndarray,
+    post2_lpf_taps: np.ndarray,
+    decimation_stage1: int,
+    decimation_stage2: int,
 ) -> np.ndarray:
     coarse = coarse_bins[st.coarse_bin_index]
     shifted, st.residual_osc = _mix_with_oscillator(coarse, np.complex64(st.residual_osc), np.complex64(st.residual_step))
-    filtered, st.lpf_zi = lfilter(lpf_taps, [1.0], shifted, zi=st.lpf_zi)
-    return filtered[::decimation]
+    return _multistage_decimate(
+        shifted=shifted,
+        post1_lpf_taps=post1_lpf_taps,
+        post2_lpf_taps=post2_lpf_taps,
+        post1_zi=st.post1_zi,
+        post2_zi=st.post2_zi,
+        decimation_stage1=decimation_stage1,
+        decimation_stage2=decimation_stage2,
+    )
 
 
 def _compute_monitor_db(
@@ -458,17 +488,44 @@ def _compute_monitor_db(
     monitor_bin_index: int,
     mixer_osc: complex,
     mixer_step: complex,
-    lpf_zi: np.ndarray,
-    lpf_taps: np.ndarray,
-    decimation: int,
-) -> tuple[float, complex, np.ndarray]:
+    post1_zi: np.ndarray,
+    post2_zi: np.ndarray,
+    post1_lpf_taps: np.ndarray,
+    post2_lpf_taps: np.ndarray,
+    decimation_stage1: int,
+    decimation_stage2: int,
+) -> tuple[float, complex, np.ndarray, np.ndarray]:
     # The monitor channel is treated as a local noise reference for squelch.
     monitor_stream = coarse_bins[monitor_bin_index]
     shifted_sq, next_osc = _mix_with_oscillator(monitor_stream, np.complex64(mixer_osc), np.complex64(mixer_step))
-    filtered_sq, next_zi = lfilter(lpf_taps, [1.0], shifted_sq, zi=lpf_zi)
-    narrow_sq = filtered_sq[::decimation]
+    narrow_sq = _multistage_decimate(
+        shifted=shifted_sq,
+        post1_lpf_taps=post1_lpf_taps,
+        post2_lpf_taps=post2_lpf_taps,
+        post1_zi=post1_zi,
+        post2_zi=post2_zi,
+        decimation_stage1=decimation_stage1,
+        decimation_stage2=decimation_stage2,
+    )
     monitor_db = _power_db(narrow_sq)
-    return monitor_db, next_osc, next_zi
+    return monitor_db, next_osc, post1_zi, post2_zi
+
+
+def _multistage_decimate(
+    shifted: np.ndarray,
+    post1_lpf_taps: np.ndarray,
+    post2_lpf_taps: np.ndarray,
+    post1_zi: np.ndarray,
+    post2_zi: np.ndarray,
+    decimation_stage1: int,
+    decimation_stage2: int,
+) -> np.ndarray:
+    stage1, post1_zi[:] = lfilter(post1_lpf_taps, [1.0], shifted, zi=post1_zi)
+    out = stage1[::decimation_stage1]
+    if decimation_stage2 > 1:
+        stage2, post2_zi[:] = lfilter(post2_lpf_taps, [1.0], out, zi=post2_zi)
+        return stage2[::decimation_stage2]
+    return out
 
 
 def _mix_with_oscillator(iq: np.ndarray, mixer_osc: np.complex64, mixer_step: np.complex64) -> tuple[np.ndarray, np.complex64]:
@@ -629,9 +686,9 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
 
         # 2) Initialize monitor DSP state used as squelch reference.
         channelizer = PolyphaseFftChannelizer(sample_rate=args.sample_rate, decimation=cfg.coarse_decimation)
-        zi_template = lfilter_zi(cfg.post_lpf_taps, [1.0]).astype(np.complex64)
+        monitor_post1_zi = lfilter_zi(cfg.post1_lpf_taps, [1.0]).astype(np.complex64)
+        monitor_post2_zi = lfilter_zi(cfg.post2_lpf_taps, [1.0]).astype(np.complex64)
         monitor_mixer_osc = np.complex64(1.0 + 0.0j)
-        monitor_lpf_zi = zi_template.copy()
 
         # 3) Stream IQ chunks, evaluate squelch, and write per-channel WAV audio.
         while running:
@@ -647,14 +704,17 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
             monitor_coarse_db = 0.0
             if not args.no_squelch:
                 monitor_coarse_db = _power_db(coarse_bins[cfg.monitor_bin_index])
-                monitor_db, monitor_mixer_osc, monitor_lpf_zi = _compute_monitor_db(
+                monitor_db, monitor_mixer_osc, monitor_post1_zi, monitor_post2_zi = _compute_monitor_db(
                     coarse_bins=coarse_bins,
                     monitor_bin_index=cfg.monitor_bin_index,
                     mixer_osc=monitor_mixer_osc,
                     mixer_step=cfg.monitor_residual_step,
-                    lpf_zi=monitor_lpf_zi,
-                    lpf_taps=cfg.post_lpf_taps,
-                    decimation=cfg.post_decimation,
+                    post1_zi=monitor_post1_zi,
+                    post2_zi=monitor_post2_zi,
+                    post1_lpf_taps=cfg.post1_lpf_taps,
+                    post2_lpf_taps=cfg.post2_lpf_taps,
+                    decimation_stage1=cfg.post_decimation_stage1,
+                    decimation_stage2=cfg.post_decimation_stage2,
                 )
 
             for st in states:
@@ -671,8 +731,10 @@ def run_recorder(args: argparse.Namespace, plan: BandPlan) -> int:
                 narrow = _extract_narrowband_channel(
                     coarse_bins=coarse_bins,
                     st=st,
-                    lpf_taps=cfg.post_lpf_taps,
-                    decimation=cfg.post_decimation,
+                    post1_lpf_taps=cfg.post1_lpf_taps,
+                    post2_lpf_taps=cfg.post2_lpf_taps,
+                    decimation_stage1=cfg.post_decimation_stage1,
+                    decimation_stage2=cfg.post_decimation_stage2,
                 )
 
                 if not args.no_squelch:
