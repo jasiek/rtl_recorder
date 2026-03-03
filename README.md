@@ -5,6 +5,7 @@ Generic USB RTL-SDR recorder with per-channel WAV output and per-channel squelch
 Scripts:
 - `pmr446_recorder.py`: PMR446 plan (16 channels)
 - `cb_recorder.py`: CB CEPT plan (40 channels)
+- `csv_recorder.py`: custom channels from CSV (`label,frequency,width`)
 
 ## Install
 ```bash
@@ -21,6 +22,20 @@ CB:
 ```bash
 python cb_recorder.py --device 0 --output-dir recordings-cb
 ```
+
+CSV custom:
+```bash
+python csv_recorder.py channels.csv --device 0 --output-dir recordings-csv
+```
+
+`channels.csv` format:
+```csv
+label,frequency,width
+Dispatch,446.00625,12.5
+Ops 2,446.01875,12.5
+```
+
+`csv_recorder.py` will refuse to run if channel frequencies span more than 2 MHz.
 
 ## Features
 - Simultaneous channel recording into `1.wav ... N.wav`
